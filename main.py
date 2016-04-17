@@ -5,14 +5,15 @@ import tpg
 class Parser(tpg.Parser): # we can enable l-value array indexing by having it bind more tightly than '='
     r"""
     # Options
-    #set lexer_dotall = True
+    set lexer_dotall = True
+    #set lexer_verbose = True
     
     token real  : '\d+\.\d*|\.\d+'        RealLiteral;
     token int   : '\d+'                   IntLiteral;
     token string: '".*?"'                 StringLiteral;
     token ident : '[A-Za-z][A-Za-z0-9_]*' IdentLiteral;
     
-    token o00: '(?<![\=\!\<\>])=(?!\=)' $ getOp
+    token o00: '(?<![\=\!\<\>])=(?![\=\!\<\>])' $ getOp
     token o01: 'or'                $ getOp
     token o02: '(and)|(&&)'        $ getOp
     token o03: 'not'               $ getOp
@@ -26,12 +27,12 @@ class Parser(tpg.Parser): # we can enable l-value array indexing by having it bi
     ;
     
     separator whitespace '\s+';
-    separator comment    '#.*?\n';
+    separator comment    '(#.*?\n)|(@.*?@)';
     
     START/a -> expression/a;
     
     expression/a -> l00/a;
-    l00/a ->(ident/a o00/op expression/b $a.isLHS = True; a = op(a, b)$) | # '=' is left-associative
+    l00/a ->(((ident/a list/b $a = IdentLiteral((a, b))$) | ident/a) o00/op expression/b $a.isLHS = True; a = op(a, b)$) | # '=' is left-associative
              l01/a;
     l01/a -> l02/a (o01/op l02/b $a = op(a, b)$)*;
     l02/a -> l03/a (o02/op l03/b $a = op(a, b)$)*;
@@ -48,15 +49,17 @@ class Parser(tpg.Parser): # we can enable l-value array indexing by having it bi
     
     commasep/a -> $a = []$ (expression/b $a.append(b)$ (',' expression/b $a.append(b)$)*)?;
     
-    block/a -> '{' $a = []$ ((blockfunc/b | (expression/b ';')) $a.append(b)$ )* '}' $a = BlockLiteral(a)$;
+    block/a -> '{' $a = []$ ((funcblockblock/b | funcblock/b | (expression/b ';')) $a.append(b)$ )* '}' $a = BlockLiteral(a)$;
 
     function/a -> ident/a '\(' commasep/b '\)' $a = FunctionLiteral(a, b)$;
     
-    blockfunc/a -> ident/a '\(' expression/e '\)' block/b $a = BlockFunctionLiteral(a, e, b)$;
+    funcblock/a -> ident/a '\(' expression/e '\)' block/b $a = FunctionBlockLiteral(a, e, b)$;
+
+    funcblockblock/a -> ident/a '\(' expression/e '\)' block/b1 ident/i2 block/b2 $a = FunctionBlockBlockLiteral(a, e, b1, i2, b2)$;
     
     list/a -> "\[" commasep/a "\]" $a = ListLiteral(a)$;
     
-    literal/a -> blockfunc/a | block/a | function/a | real/a | int/a | string/a | list/a | ident/a;
+    literal/a -> funcblockblock/a | funcblock/a | block/a | function/a | real/a | int/a | string/a | list/a | ident/a;
     """
 
 class Context(dict):
@@ -74,14 +77,14 @@ class Context(dict):
                             cur[key] = val
                             return
                         cur = cur.parent
-                    self[key] = val
+                        self[key] = val
 
             def __repr__(self):
                 return repr((dict.__repr__(self),str(self.parent)))
-    
+            
 class SemanticError(Exception):
     pass
-    
+
 class Node(object):
     def evaluate(self, context):
         """
@@ -144,7 +147,7 @@ class FunctionLiteral(Node):
     def __repr__(self):
         return 'func:'+repr(self.ident)+'('+repr(self.args)+')'
 
-class BlockFunctionLiteral(Node):
+class FunctionBlockLiteral(Node):
     def __init__(self, ident, head, body):
         self.ident = ident
         self.head = head
@@ -154,8 +157,20 @@ class BlockFunctionLiteral(Node):
         self.ident.evaluate(context)(self.head, self.body, context)
 
     def __repr__(self):
-        return 'bfunc:'+repr(self.ident)+'('+repr(self.head)+')'+repr(self.body)
-        
+        return 'funcblock:'+repr(self.ident)+'('+repr(self.head)+')'+repr(self.body)
+
+class FunctionBlockBlockLiteral(Node):
+    def __init__(self, ident1, head, body1, ident2, body2):
+        self.ident = IdentLiteral((ident1.name, ident2.name))
+        self.head = head
+        self.body1, self.body2 = body1, body2
+
+    def evaluate(self, context):
+        self.ident.evaluate(context)(self.head, self.body1, self.body2, context)
+
+    def __repr__(self):
+        return 'funcblockblock:'+repr(self.ident)+'('+repr(self.head)+')'+repr(self.body2)+repr(self.body2)
+    
 class ListLiteral(Node):
     def __init__(self, value):
         self.value = value
@@ -173,7 +188,13 @@ class IdentLiteral(Node):
         
     def evaluate(self, context):
         if self.isLHS:
-            return lambda val: context.update({self.name: val})
+            name = self.name
+            if type(name) is tuple:
+                def setListElement(val):
+                    self.name[0].evaluate(context)[self.name[1].evaluate(context)[0]] = val
+                return lambda val: setListElement(val)
+            else:
+                return lambda val: context.update({self.name: val})
         else:
             return context[self.name]
 
@@ -194,7 +215,7 @@ def makeOps():
             
         OpClass.__name__ = name
         return OpClass
-        
+    
     ops = {
         'index': lambda x, y: x[y[0]],
         '*':     lambda x, y: x *  y,
@@ -224,16 +245,27 @@ def makeOps():
         
     global getOp
     def getOp(x):
-        print('getOp({})'.format(x))
         return ops[x]
 
-def hwile(cond, body, context):
+def myWhile(cond, body, context):
     while cond.evaluate(context):
         body.evaluate(context)
 
+def myIf(cond, body, context):
+    if cond.evaluate(context):
+        body.evaluate(context)
+        
+def myIfElse(cond, ifBody, elseBody, context):
+    if cond.evaluate(context):
+        ifBody.evaluate(context)
+    else:
+        elseBody.evaluate(context)
+        
 builtins = Context()
 builtins.update({
-    'while': hwile,
+    'while': myWhile,
+    'if':    myIf,
+    ('if','else'): myIfElse,
     'print': lambda x: print(repr(x)),
     'add':   lambda x, y: x + y,
 })
